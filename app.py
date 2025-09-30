@@ -9,9 +9,9 @@ st.set_page_config(page_title="GTIN/EAN Finder via Google CSE (Excel)", layout="
 st.title("GTIN/EAN Finder via Google CSE (Excel)")
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
-GOOGLE_CSE_CX = st.secrets.get("GOOGLE_CSE_CX")
+GOOGLE_CSE_CX  = st.secrets.get("GOOGLE_CSE_CX")
 
-# sidebar info
+# Sidebar info
 st.sidebar.header("Config check")
 st.sidebar.write("API Key loaded:", bool(GOOGLE_API_KEY))
 st.sidebar.write("CX loaded:", bool(GOOGLE_CSE_CX))
@@ -44,9 +44,13 @@ def is_valid_ean13(code: str) -> bool:
     return bool(re.fullmatch(r"\d{13}", code)) and int(code[-1]) == ean13_check_digit(code[:12])
 
 def upc12_to_gtin13(upc12: str) -> str | None:
+    """
+    UPC-A (12 cifre) -> GTIN-13 prin prefix '0'. Nu recalcula check digit separat.
+    """
     if not re.fullmatch(r"\d{12}", upc12):
         return None
-    return make_ean13("0" + upc12)
+    gtin13 = "0" + upc12
+    return gtin13 if is_valid_ean13(gtin13) else None
 
 def ean13_from_seed(seed: str) -> str:
     """Generează EAN-13 VALID din seed textual (stabil)."""
@@ -69,7 +73,12 @@ def find_eans_in_text(text: str):
         elif len(d) == 12:
             gt = upc12_to_gtin13(d)
             if gt: out.append(gt)
-    return list(dict.fromkeys(out))
+    # dedup păstrând ordinea
+    seen, res = set(), []
+    for x in out:
+        if x not in seen:
+            res.append(x); seen.add(x)
+    return res
 
 def choose_best_ean(texts_with_weights):
     scores = {}
@@ -141,23 +150,23 @@ if uploaded:
 
     st.write("Previzualizare:", df.head(10))
     cols = list(df.columns)
-    col_sku = st.selectbox("Coloană SKU", cols, index=0)
-    col_name = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
+    col_sku    = st.selectbox("Coloană SKU", cols, index=0)
+    col_name   = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
     col_target = st.selectbox("Coloană țintă pentru EAN-13", cols, index=len(cols)-1)
-    mode = st.radio("Cum cauți EAN?", ["Doar SKU", "Doar Nume"])
+    mode       = st.radio("Cum cauți EAN?", ["Doar SKU", "Doar Nume"])
 
-    # opțiune existentă: generare EAN dacă nu găsește
+    # opțiune: generare EAN dacă nu găsește
     synth_mode = st.radio(
         "Completează cu EAN sintetic dacă nu găsește prin Google?",
         ["Nu", "Da"]
     )
 
-    # coloană de notă (păstrată)
+    # coloană de notă
     note_col = "EAN_NOTE"
     if note_col not in df.columns:
         df[note_col] = ""
 
-    # selecție rânduri (păstrată)
+    # selecție rânduri
     mode_rows = st.radio("Ce rânduri procesezi?", ["Primele N rânduri", "Toate rândurile"])
     if mode_rows == "Primele N rânduri":
         max_rows = st.number_input("N rânduri de procesat", 1, len(df), min(50, len(df)))
@@ -169,20 +178,22 @@ if uploaded:
 
     if st.button("Pornește căutarea EAN"):
         done = 0; bar = st.progress(0); status = st.empty(); query_status = st.empty()
+
         for idx, row in df.head(int(max_rows)).iterrows():
             sku  = str(row.get(col_sku,"")).strip()
             name = str(row.get(col_name,"")).strip()
             current = str(row.get(col_target,"")).strip()
-            note = str(row.get(note_col,"")).strip().lower()
+            note    = str(row.get(note_col,"")).strip().lower()
 
-            # Skip dacă are deja EAN valid sau NOT_FOUND sau synthetic
+            # Skip dacă are EAN valid, NOT_FOUND sau deja synthetic
             if (current and is_valid_ean13(current)) or current.upper()=="NOT_FOUND" or note=="synthetic":
                 done += 1; bar.progress(int(done*100/max_rows)); continue
 
             found = lookup(mode, sku, name, query_status)
+
             if found and is_valid_ean13(found):
                 df.at[idx, col_target] = found
-                df.at[idx, note_col] = "found"
+                df.at[idx, note_col]   = "found"
                 used_eans.add(found)
             else:
                 if synth_mode == "Da":
@@ -190,19 +201,19 @@ if uploaded:
                     code = ean13_from_seed(seed)
                     # evită coliziuni; dacă există, încearcă seed+contor
                     tries = 0
-                    while code in used_eans and tries < 1000:
+                    while (code in used_eans) and tries < 1000:
                         tries += 1
                         code = ean13_from_seed(f"{seed}|{tries}")
                     if is_valid_ean13(code) and code not in used_eans:
                         df.at[idx, col_target] = code
-                        df.at[idx, note_col] = "synthetic"
+                        df.at[idx, note_col]   = "synthetic"
                         used_eans.add(code)
                     else:
                         df.at[idx, col_target] = "NOT_FOUND"
-                        df.at[idx, note_col] = "gen_error"
+                        df.at[idx, note_col]   = "gen_error"
                 else:
                     df.at[idx, col_target] = "NOT_FOUND"
-                    df.at[idx, note_col] = "not_found"
+                    df.at[idx, note_col]   = "not_found"
 
             done += 1
             if done % 5 == 0:
