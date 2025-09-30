@@ -18,6 +18,8 @@ st.sidebar.write("CX loaded:", bool(GOOGLE_CSE_CX))
 
 if "request_count" not in st.session_state:
     st.session_state["request_count"] = 0
+if "synth_counter" not in st.session_state:
+    st.session_state["synth_counter"] = 1
 DAILY_LIMIT = 100
 
 # ==============================
@@ -25,8 +27,7 @@ DAILY_LIMIT = 100
 # ==============================
 def ean13_check_digit(d12: str) -> int:
     """
-    d12 = exact 12 cifre (string). Returnează cifra de control EAN-13.
-    Regulă: poziții impare *1, poziții pare *3 (numerotare de la stânga, 1..12).
+    d12 = exact 12 cifre. Poziții impare*1, pare*3 (indexare 1..12).
     """
     if not re.fullmatch(r"\d{12}", d12):
         raise ValueError("d12 trebuie să aibă exact 12 cifre")
@@ -37,29 +38,21 @@ def ean13_check_digit(d12: str) -> int:
     return (10 - (s % 10)) % 10
 
 def make_ean13(d12: str) -> str:
-    """Construiește EAN-13 complet din primele 12 cifre."""
     return d12 + str(ean13_check_digit(d12))
 
 def is_valid_ean13(code: str) -> bool:
-    """Verifică lungime 13 și cifră de control corectă."""
     return bool(re.fullmatch(r"\d{13}", code)) and int(code[-1]) == ean13_check_digit(code[:12])
 
-def upc12_to_gtin13(upc12: str) -> str:
-    """Transformă UPC-A (12 cifre) în GTIN-13 prin prefix 0 și recalcul check digit."""
+def upc12_to_gtin13(upc12: str) -> str | None:
     if not re.fullmatch(r"\d{12}", upc12):
-        raise ValueError("UPC trebuie să aibă exact 12 cifre")
+        return None
     return make_ean13("0" + upc12)
 
 def ean13_from_seed(seed: str) -> str:
-    """
-    Generează un EAN-13 VALID dintr-un seed text:
-    - ia 12 cifre din SHA-256(seed)
-    - calculează cifra de control
-    """
+    """Generează EAN-13 VALID din seed textual (stabil)."""
     h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
     core12 = str(int(h, 16) % (10**12)).zfill(12)
     return make_ean13(core12)
-
 # ==============================
 
 def clean_digits(s: str) -> str:
@@ -74,10 +67,8 @@ def find_eans_in_text(text: str):
         if len(d) == 13 and is_valid_ean13(d):
             out.append(d)
         elif len(d) == 12:
-            try:
-                gt = upc12_to_gtin13(d)
-                if gt: out.append(gt)
-            except: pass
+            gt = upc12_to_gtin13(d)
+            if gt: out.append(gt)
     return list(dict.fromkeys(out))
 
 def choose_best_ean(texts_with_weights):
@@ -106,7 +97,8 @@ def fetch_url_text(url: str, timeout: int = 12) -> str:
         if r.status_code != 200: return ""
         txt = re.sub(r"<[^>]+>", " ", r.text, flags=re.DOTALL)
         return re.sub(r"\s+", " ", txt)
-    except Exception: return ""
+    except Exception:
+        return ""
 
 def lookup(mode: str, sku: str, name: str, query_status, max_urls: int = 5):
     if mode == "Doar SKU":
@@ -154,24 +146,84 @@ if uploaded:
     col_target = st.selectbox("Coloană țintă pentru EAN-13", cols, index=len(cols)-1)
     mode = st.radio("Cum cauți EAN?", ["Doar SKU", "Doar Nume"])
 
-    if st.button("Testează generatorul EAN"):
-        seed = "SKU123|Ecran Samsung A04s"
-        st.write("Exemplu synthetic:", ean13_from_seed(seed))
+    # opțiune existentă: generare EAN dacă nu găsește
+    synth_mode = st.radio(
+        "Completează cu EAN sintetic dacă nu găsește prin Google?",
+        ["Nu", "Da"]
+    )
+
+    # coloană de notă (păstrată)
+    note_col = "EAN_NOTE"
+    if note_col not in df.columns:
+        df[note_col] = ""
+
+    # selecție rânduri (păstrată)
+    mode_rows = st.radio("Ce rânduri procesezi?", ["Primele N rânduri", "Toate rândurile"])
+    if mode_rows == "Primele N rânduri":
+        max_rows = st.number_input("N rânduri de procesat", 1, len(df), min(50, len(df)))
+    else:
+        max_rows = len(df)
+
+    # set EAN-uri deja folosite pentru unicitate locală
+    used_eans = set(x for x in df[col_target].astype(str).tolist() if is_valid_ean13(str(x)))
 
     if st.button("Pornește căutarea EAN"):
         done = 0; bar = st.progress(0); status = st.empty(); query_status = st.empty()
-        for idx, row in df.iterrows():
-            sku, name = str(row.get(col_sku,"")).strip(), str(row.get(col_name,"")).strip()
+        for idx, row in df.head(int(max_rows)).iterrows():
+            sku  = str(row.get(col_sku,"")).strip()
+            name = str(row.get(col_name,"")).strip()
             current = str(row.get(col_target,"")).strip()
-            if current and is_valid_ean13(current):
-                continue
+            note = str(row.get(note_col,"")).strip().lower()
+
+            # Skip dacă are deja EAN valid sau NOT_FOUND sau synthetic
+            if (current and is_valid_ean13(current)) or current.upper()=="NOT_FOUND" or note=="synthetic":
+                done += 1; bar.progress(int(done*100/max_rows)); continue
+
             found = lookup(mode, sku, name, query_status)
             if found and is_valid_ean13(found):
                 df.at[idx, col_target] = found
-        st.success("Terminat")
+                df.at[idx, note_col] = "found"
+                used_eans.add(found)
+            else:
+                if synth_mode == "Da":
+                    seed = f"{sku}|{name}"
+                    code = ean13_from_seed(seed)
+                    # evită coliziuni; dacă există, încearcă seed+contor
+                    tries = 0
+                    while code in used_eans and tries < 1000:
+                        tries += 1
+                        code = ean13_from_seed(f"{seed}|{tries}")
+                    if is_valid_ean13(code) and code not in used_eans:
+                        df.at[idx, col_target] = code
+                        df.at[idx, note_col] = "synthetic"
+                        used_eans.add(code)
+                    else:
+                        df.at[idx, col_target] = "NOT_FOUND"
+                        df.at[idx, note_col] = "gen_error"
+                else:
+                    df.at[idx, col_target] = "NOT_FOUND"
+                    df.at[idx, note_col] = "not_found"
+
+            done += 1
+            if done % 5 == 0:
+                status.write(f"Procesate: {done}/{int(max_rows)}")
+            bar.progress(int(done*100/max_rows)); time.sleep(0.2)
+
+        st.success(f"Terminat. Rânduri procesate: {done}.")
+        excel_data = to_excel_bytes(df)
         st.download_button(
             "Descarcă Excel completat",
-            data=to_excel_bytes(df),
+            data=excel_data,
             file_name="output_ean.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download-ean"
+        )
+        st.markdown(
+            """
+            <script>
+            const btn = window.parent.document.querySelector('button[data-testid="stDownloadButton-download-ean"]');
+            if (btn) { btn.click(); }
+            </script>
+            """,
+            unsafe_allow_html=True
         )
