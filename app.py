@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
 import re, time
-from collections import Counter
 import pandas as pd
 import streamlit as st
 import requests
 from io import BytesIO
+from collections import Counter  # nou
 
 st.set_page_config(page_title="GTIN/EAN Finder via Google CSE (Excel)", layout="wide")
 st.title("GTIN/EAN Finder via Google CSE (Excel)")
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
-GOOGLE_CSE_CX  = st.secrets.get("GOOGLE_CSE_CX")
+GOOGLE_CSE_CX = st.secrets.get("GOOGLE_CSE_CX")
 
-# Sidebar info
+# sidebar info
 st.sidebar.header("Config check")
 st.sidebar.write("API Key loaded:", bool(GOOGLE_API_KEY))
 st.sidebar.write("CX loaded:", bool(GOOGLE_CSE_CX))
 
 if "request_count" not in st.session_state:
     st.session_state["request_count"] = 0
+# contor pentru EAN sintetic (nou)
 if "synth_counter" not in st.session_state:
     st.session_state["synth_counter"] = 1
+
 DAILY_LIMIT = 100
 
-# ---------- EAN helpers ----------
 def clean_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
 
@@ -63,51 +64,11 @@ def choose_best_ean(texts_with_weights):
             scores[c] = scores.get(c, 0.0) + base * w
     return max(scores.items(), key=lambda kv: kv[1])[0] if scores else None
 
-# ---------- Name compactor (partial matching) ----------
-STOPWORDS = set("""
-ecran compatibil pentru cu fara rama ramă ramă- rama- rame original service pack kit set
-display lcd touch touch-screen digitizer sticla sticlă geam complet completat completă
-negru black alb white albastru blue verde green rosu red argintiu silver auriu gold
-baterie acumulator incarcare încărcare cablu adaptor mufa mufă camera cameră spate fata față
-husa husă carcasa carcasă folie protectie protecție capac capacul subtitlu model cod
-nou new oferte oferta produs produsul varianta variantă versiune versiunea 2020 2021 2022 2023 2024 2025
-""".split())
-
-BRANDS_HINT = re.compile(r"\b(samsung|apple|iphone|xiaomi|redmi|huawei|nokia|oneplus|motorola|sony|oppo|realme|google|pixel|lenovo|lg)\b", re.I)
-
-def compact_name(name: str) -> str:
-    # păstrează doar tokeni utili: branduri, tokeni alfanumerici (ex A04s, A047), cuvinte scurte relevante (ex ncc)
-    n = re.sub(r"[^\w\s\-]+", " ", name.lower())
-    raw = re.split(r"\s+|[-_/()]", n)
-    tokens = []
-    for t in raw:
-        if not t or t in STOPWORDS: 
-            continue
-        # acceptă branduri recunoscute
-        if BRANDS_HINT.search(t):
-            tokens.append(t)
-            continue
-        # păstrează tokeni alfanumerici (modele: a04s, a047, sm-s906b etc.)
-        if re.search(r"[a-z].*\d|\d.*[a-z]", t):
-            tokens.append(t)
-            continue
-        # păstrează tokeni scurți utili de tip cod furnizor (ex: ncc, oem)
-        if len(t) <= 4 and t.isalpha():
-            tokens.append(t)
-            continue
-    # dedup păstrând ordinea
-    seen, out = set(), []
-    for t in tokens:
-        if t not in seen:
-            out.append(t); seen.add(t)
-    return " ".join(out).strip()
-
-# ---------- Google CSE ----------
 def google_search(query: str, num: int = 5):
     if not GOOGLE_API_KEY or not GOOGLE_CSE_CX:
         st.warning("Cheile Google lipsesc.")
         return []
-    params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": min(num,10), "safe": "off"}
+    params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": min(num, 10), "safe": "off"}
     r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
     st.session_state["request_count"] += 1
     if r.status_code != 200: return []
@@ -115,30 +76,17 @@ def google_search(query: str, num: int = 5):
 
 def fetch_url_text(url: str, timeout: int = 12) -> str:
     try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent":"Mozilla/5.0"})
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200: return ""
         txt = re.sub(r"<[^>]+>", " ", r.text, flags=re.DOTALL)
-        return re.sub(r"\s+"," ", txt)
-    except Exception:
-        return ""
+        return re.sub(r"\s+", " ", txt)
+    except Exception: return ""
 
-def lookup(mode: str, sku: str, name: str, query_status, preferred_site: str | None, max_urls: int = 5):
-    queries = []
+def lookup(mode: str, sku: str, name: str, query_status, max_urls: int = 5):
     if mode == "Doar SKU":
-        base = [f'"{sku}" ean', f'"{sku}" gtin']
-        if preferred_site: queries += [f"site:{preferred_site} {q}" for q in base]
-        queries += base
+        queries = [f'"{sku}" ean', f'"{sku}" gtin']
     else:
-        compact = compact_name(name) or name.strip()
-        # puține interogări, în ordinea: site preferat -> global
-        base_compact = [f'"{compact}" ean', f'"{compact}" gtin', f"{compact} ean"]
-        if preferred_site: queries += [f"site:{preferred_site} {q}" for q in base_compact]
-        queries += base_compact
-        # fallback slab: numele întreg
-        base_full = [f'"{name}" ean', f'"{name}" gtin']
-        if preferred_site: queries += [f"site:{preferred_site} {q}" for q in base_full]
-        queries += base_full
-
+        queries = [f'"{name}" ean', f'"{name}" gtin']
     texts = []
     for q in queries:
         query_status.write(f"Query trimis: {q}")
@@ -154,29 +102,31 @@ def lookup(mode: str, sku: str, name: str, query_status, preferred_site: str | N
         if best: return best
     return choose_best_ean(texts)
 
-# ---------- Synthetic EAN ----------
-def most_common_prefix(eans: list[str], length: int = 7) -> str | None:
-    pref = [e[:length] for e in eans if len(e) >= length]
-    if not pref: return None
-    return Counter(pref).most_common(1)[0][0]
-
-def generate_synthetic_ean(prefix: str, seq: int) -> str:
-    core = f"{prefix}{seq:0{12-len(prefix)}d}"[:12]
-    cd = ean13_check_digit(core)
-    return core + str(cd)
-
 def to_excel_bytes(df: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="EANs")
     return output.getvalue()
 
-# ---------- UI ----------
+# ---------- utilitare EAN sintetic (nou) ----------
+def most_common_prefix(eans, length=7):
+    vals = [str(e) for e in eans if is_valid_ean13(str(e))]
+    if not vals: return None
+    prefs = [str(e)[:length] for e in vals]
+    if not prefs: return None
+    return Counter(prefs).most_common(1)[0][0]
+
+def generate_synthetic_ean(prefix: str, seq: int) -> str:
+    core = f"{prefix}{seq:0{12-len(prefix)}d}"[:12]
+    cd = ean13_check_digit(core)
+    return core + str(cd)
+
+# Sidebar quota
 st.sidebar.header("Quota Google API")
 st.sidebar.write("Requests in session:", st.session_state["request_count"])
 st.sidebar.write("Estimated daily free limit:", DAILY_LIMIT)
 
-uploaded = st.file_uploader("Încarcă fișier Excel", type=["xls","xlsx"])
+uploaded = st.file_uploader("Încarcă fișier Excel", type=["xls", "xlsx"])
 if uploaded:
     try:
         df = pd.read_excel(uploaded, engine="openpyxl")
@@ -185,63 +135,60 @@ if uploaded:
         st.stop()
 
     st.write("Previzualizare:", df.head(10))
-
     cols = list(df.columns)
-    col_sku    = st.selectbox("Coloană SKU", cols, index=0)
-    col_name   = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
+    col_sku = st.selectbox("Coloană SKU", cols, index=0)
+    col_name = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
     col_target = st.selectbox("Coloană țintă pentru EAN-13", cols, index=len(cols)-1)
-    mode       = st.radio("Cum cauți EAN?", ["Doar SKU","Doar Nume"])
-    preferred_site = st.text_input("Site preferat (ex: gsmok.com), opțional", value="").strip() or None
+    mode = st.radio("Cum cauți EAN?", ["Doar SKU", "Doar Nume"])
 
+    # opțiune nouă: generare EAN dacă nu găsește
     synth_mode = st.radio(
-        "Completează automat când nu găsește?",
-        ["Nu, lasă NOT_FOUND", "Da, generează EAN sintetic din prefixul găsit"]
+        "Completează cu EAN sintetic dacă nu găsește prin Google?",
+        ["Nu", "Da"]
     )
 
-    mode_rows = st.radio("Ce rânduri procesezi?", ["Primele N rânduri","Toate rândurile"])
+    # pregătim coloana de notă (nou)
+    note_col = "EAN_NOTE"
+    if note_col not in df.columns:
+        df[note_col] = ""
+
+    # Alegere rânduri
+    mode_rows = st.radio("Ce rânduri procesezi?", ["Primele N rânduri", "Toate rândurile"])
     if mode_rows == "Primele N rânduri":
         max_rows = st.number_input("N rânduri de procesat", 1, len(df), min(50,len(df)))
     else:
         max_rows = len(df)
 
-    note_col = "EAN_NOTE"
-    if note_col not in df.columns:
-        df[note_col] = ""
-
-    existing_valid = [str(v) for v in df[col_target].astype(str).tolist() if is_valid_ean13(str(v))]
-    default_prefix = most_common_prefix(existing_valid, length=7) or "2000000"
+    # prefix default pentru EAN sintetic: din ce există sau fallback
+    default_prefix = most_common_prefix(df[col_target].tolist(), length=7) or "2000000"
 
     if st.button("Pornește căutarea EAN"):
         done = 0; bar = st.progress(0); status = st.empty(); query_status = st.empty()
-
         for idx, row in df.head(int(max_rows)).iterrows():
-            sku  = str(row.get(col_sku,"")).strip()
-            name = str(row.get(col_name,"")).strip()
-            cur  = str(row.get(col_target,"")).strip()
-            note = str(row.get(note_col,"")).strip().lower()
+            sku, name = str(row.get(col_sku,"")).strip(), str(row.get(col_name,"")).strip()
+            current = str(row.get(col_target,"")).strip()
 
-            # Skip dacă există EAN valid, NOT_FOUND sau synthetic
-            if (cur and is_valid_ean13(cur)) or cur.upper()=="NOT_FOUND" or note=="synthetic":
+            # Skip dacă deja are EAN valid sau NOT_FOUND (nu schimbăm logica existentă)
+            if current and (is_valid_ean13(current) or current.upper()=="NOT_FOUND"):
                 done+=1; bar.progress(int(done*100/max_rows)); continue
 
-            found = lookup(mode, sku, name, query_status, preferred_site)
-
+            found = lookup(mode, sku, name, query_status)
             if found and is_valid_ean13(found):
                 df.at[idx, col_target] = found
-                df.at[idx, note_col]   = "found"
+                df.at[idx, note_col] = "found"
             else:
-                if synth_mode.endswith("sintetic"):
+                if synth_mode == "Da":
                     seq = st.session_state["synth_counter"]; st.session_state["synth_counter"] += 1
                     code = generate_synthetic_ean(default_prefix, seq)
                     df.at[idx, col_target] = code
-                    df.at[idx, note_col]   = "synthetic"
+                    df.at[idx, note_col] = "synthetic"
                 else:
                     df.at[idx, col_target] = "NOT_FOUND"
-                    df.at[idx, note_col]   = "not_found"
+                    df.at[idx, note_col] = "not_found"
 
             done+=1
             if done%5==0: status.write(f"Procesate: {done}/{int(max_rows)}")
-            bar.progress(int(done*100/max_rows)); time.sleep(0.12)
+            bar.progress(int(done*100/max_rows)); time.sleep(0.2)
 
         st.success(f"Terminat. Rânduri procesate: {done}.")
         excel_data = to_excel_bytes(df)
