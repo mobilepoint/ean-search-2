@@ -63,43 +63,44 @@ def choose_best_ean(texts_with_weights):
             scores[c] = scores.get(c, 0.0) + base * w
     return max(scores.items(), key=lambda kv: kv[1])[0] if scores else None
 
-# ---------- Multilingual keywords ----------
-KEYWORDS = {
-    "screen": ["ecran","display","lcd","touch","écran","afficheur","vitre","bildschirm","scherm","wyświetlacz","ekran"],
-    "battery":["baterie","acumulator","battery","batterie","akku","batterij","accu","bateria","akumulator"],
-    "case":   ["husă","husa","carcasă","carcasa","case","cover","housing","coque","étui","hülle","gehäuse","hoesje","behuizing","etui","obudowa","pokrowiec"],
-}
+# ---------- Name compactor (partial matching) ----------
+STOPWORDS = set("""
+ecran compatibil pentru cu fara rama ramă ramă- rama- rame original service pack kit set
+display lcd touch touch-screen digitizer sticla sticlă geam complet completat completă
+negru black alb white albastru blue verde green rosu red argintiu silver auriu gold
+baterie acumulator incarcare încărcare cablu adaptor mufa mufă camera cameră spate fata față
+husa husă carcasa carcasă folie protectie protecție capac capacul subtitlu model cod
+nou new oferte oferta produs produsul varianta variantă versiune versiunea 2020 2021 2022 2023 2024 2025
+""".split())
 
-def detect_topics(name: str) -> list[str]:
-    n = name.lower()
-    topics = []
-    if re.search(r"\b(ecran|display|lcd|touch|screen|écran|afficheur|vitre|bildschirm|scherm|wyświetlacz|ekran)\b", n):
-        topics.append("screen")
-    if re.search(r"\b(baterie|acumulator|battery|batterie|akku|batterij|accu|bateria|akumulator)\b", n):
-        topics.append("battery")
-    if re.search(r"\b(hus[ăa]|carcas[ăa]|case|cover|housing|coque|étui|hülle|gehäuse|hoesje|behuizing|etui|obudowa|pokrowiec)\b", n):
-        topics.append("case")
-    return topics
+BRANDS_HINT = re.compile(r"\b(samsung|apple|iphone|xiaomi|redmi|huawei|nokia|oneplus|motorola|sony|oppo|realme|google|pixel|lenovo|lg)\b", re.I)
 
-def build_name_queries(name: str, preferred_site: str | None) -> list[str]:
-    base_terms = ['ean','gtin']
-    topics = detect_topics(name)
-    tokens = set()
-    for t in topics:
-        tokens.update(KEYWORDS.get(t, []))
-    if not tokens:
-        tokens.update(base_terms)
-    queries = []
-    for term in sorted(tokens):
-        q = f'"{name}" {term}'
-        if preferred_site: queries.append(f"site:{preferred_site} {q}")
-    for term in sorted(tokens):
-        queries.append(f'"{name}" {term}')
-    for t in base_terms:
-        if preferred_site: queries.append(f'site:{preferred_site} "{name}" {t}')
-    for t in base_terms:
-        queries.append(f'"{name}" {t}')
-    return queries
+def compact_name(name: str) -> str:
+    # păstrează doar tokeni utili: branduri, tokeni alfanumerici (ex A04s, A047), cuvinte scurte relevante (ex ncc)
+    n = re.sub(r"[^\w\s\-]+", " ", name.lower())
+    raw = re.split(r"\s+|[-_/()]", n)
+    tokens = []
+    for t in raw:
+        if not t or t in STOPWORDS: 
+            continue
+        # acceptă branduri recunoscute
+        if BRANDS_HINT.search(t):
+            tokens.append(t)
+            continue
+        # păstrează tokeni alfanumerici (modele: a04s, a047, sm-s906b etc.)
+        if re.search(r"[a-z].*\d|\d.*[a-z]", t):
+            tokens.append(t)
+            continue
+        # păstrează tokeni scurți utili de tip cod furnizor (ex: ncc, oem)
+        if len(t) <= 4 and t.isalpha():
+            tokens.append(t)
+            continue
+    # dedup păstrând ordinea
+    seen, out = set(), []
+    for t in tokens:
+        if t not in seen:
+            out.append(t); seen.add(t)
+    return " ".join(out).strip()
 
 # ---------- Google CSE ----------
 def google_search(query: str, num: int = 5):
@@ -122,11 +123,21 @@ def fetch_url_text(url: str, timeout: int = 12) -> str:
         return ""
 
 def lookup(mode: str, sku: str, name: str, query_status, preferred_site: str | None, max_urls: int = 5):
+    queries = []
     if mode == "Doar SKU":
         base = [f'"{sku}" ean', f'"{sku}" gtin']
-        queries = ([f"site:{preferred_site} {q}" for q in base] if preferred_site else []) + base
+        if preferred_site: queries += [f"site:{preferred_site} {q}" for q in base]
+        queries += base
     else:
-        queries = build_name_queries(name, preferred_site)
+        compact = compact_name(name) or name.strip()
+        # puține interogări, în ordinea: site preferat -> global
+        base_compact = [f'"{compact}" ean', f'"{compact}" gtin', f"{compact} ean"]
+        if preferred_site: queries += [f"site:{preferred_site} {q}" for q in base_compact]
+        queries += base_compact
+        # fallback slab: numele întreg
+        base_full = [f'"{name}" ean', f'"{name}" gtin']
+        if preferred_site: queries += [f"site:{preferred_site} {q}" for q in base_full]
+        queries += base_full
 
     texts = []
     for q in queries:
@@ -176,10 +187,10 @@ if uploaded:
     st.write("Previzualizare:", df.head(10))
 
     cols = list(df.columns)
-    col_sku   = st.selectbox("Coloană SKU", cols, index=0)
-    col_name  = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
-    col_target= st.selectbox("Coloană țintă pentru EAN-13", cols, index=len(cols)-1)
-    mode      = st.radio("Cum cauți EAN?", ["Doar SKU","Doar Nume"])
+    col_sku    = st.selectbox("Coloană SKU", cols, index=0)
+    col_name   = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
+    col_target = st.selectbox("Coloană țintă pentru EAN-13", cols, index=len(cols)-1)
+    mode       = st.radio("Cum cauți EAN?", ["Doar SKU","Doar Nume"])
     preferred_site = st.text_input("Site preferat (ex: gsmok.com), opțional", value="").strip() or None
 
     synth_mode = st.radio(
@@ -230,7 +241,7 @@ if uploaded:
 
             done+=1
             if done%5==0: status.write(f"Procesate: {done}/{int(max_rows)}")
-            bar.progress(int(done*100/max_rows)); time.sleep(0.15)
+            bar.progress(int(done*100/max_rows)); time.sleep(0.12)
 
         st.success(f"Terminat. Rânduri procesate: {done}.")
         excel_data = to_excel_bytes(df)
