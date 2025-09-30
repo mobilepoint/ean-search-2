@@ -10,7 +10,7 @@ st.set_page_config(page_title="GTIN/EAN Finder via Google CSE (Excel)", layout="
 st.title("GTIN/EAN Finder via Google CSE (Excel)")
 
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
-GOOGLE_CSE_CX  = st.secrets.get("GOOGLE_CSE_CX")
+GOOGLE_CSE_CX = st.secrets.get("GOOGLE_CSE_CX")
 
 # sidebar info
 st.sidebar.header("Config check")
@@ -19,13 +19,13 @@ st.sidebar.write("CX loaded:", bool(GOOGLE_CSE_CX))
 
 if "request_count" not in st.session_state:
     st.session_state["request_count"] = 0
-
 DAILY_LIMIT = 100
 
 def clean_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
 
 def ean13_check_digit(d12: str) -> int:
+    # d12: primele 12 cifre ca string
     s = sum((ord(ch)-48) * (3 if i%2 else 1) for i, ch in enumerate(d12))
     return (10 - (s % 10)) % 10
 
@@ -105,59 +105,23 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
         df.to_excel(writer, index=False, sheet_name="EANs")
     return output.getvalue()
 
-# ---------- EAN sintetic corect ----------
-def most_common_prefix(eans, min_len=6, max_len=9):
-    vals = [clean_digits(str(e)) for e in eans if is_valid_ean13(str(e))]
-    if not vals: return None
-    # testează lungimi 9..6 și ia cea mai frecventă
-    best = None; best_cnt = -1
-    for L in range(max_len, min_len-1, -1):
-        prefs = [v[:L] for v in vals]
-        if not prefs: continue
-        pref, cnt = Counter(prefs).most_common(1)[0]
-        if cnt > best_cnt:
-            best = pref; best_cnt = cnt
-    return best
-
-def hash_ref(s: str, digits: int) -> int:
-    h = hashlib.sha256(s.encode("utf-8")).hexdigest()
-    return int(h, 16) % (10**digits)
-
-def build_synthetic_ean(sku: str, name: str, base_prefix: str | None, used: set[str]) -> str:
-    # 1) prefix realist
-    if base_prefix:
-        prefix = clean_digits(base_prefix)[:11]
-    else:
-        # derivă un prefix stabil din date dacă nu există în fișier
-        seed = (sku or "") + "|" + (name or "")
-        d = str(hash_ref(seed, 7)).rjust(7, "2")  # 7 cifre, evită multe zerouri
-        prefix = d
-    if len(prefix) < 6:
-        prefix = (prefix + "201234")[:6]
-    if len(prefix) > 11:
-        prefix = prefix[:11]
-
-    # 2) lungimea referinței
-    item_len = 12 - len(prefix)
-    if item_len <= 0:
-        prefix = prefix[:7]
-        item_len = 5  # 7 + 5 = 12
-
-    # 3) referință din hash(SKU|Name) pentru a evita zerourile
-    seed = f"{sku}|{name}"
-    ref = hash_ref(seed, item_len)
-
-    # 4) căutare a unui cod liber în caz de coliziune
-    space = 10**item_len
-    for i in range(min(space, 10000)):
-        core = f"{prefix}{(ref + i) % space:0{item_len}d}"
+# ----- EAN sintetic corect, unic în fișier -----
+def generate_synthetic_ean_from(seed: str, used: set[str]) -> str:
+    """
+    Generează EAN-13 valid din SHA-256(seed).
+    - ia 12 cifre din hash
+    - calculează cifra de control
+    - evită coliziunile față de 'used'
+    """
+    core_int = int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) % (10**12)
+    for i in range(10000):  # rezolvă coliziuni locale
+        core = str((core_int + i) % (10**12)).zfill(12)
         cd = ean13_check_digit(core)
         ean = core + str(cd)
         if ean not in used:
             return ean
-
-    # fallback ultimă instanță
-    core = f"{prefix}{0:0{item_len}d}"
+    # fallback teoretic
+    core = "0"*12
     return core + str(ean13_check_digit(core))
 
 # Sidebar quota
@@ -175,59 +139,61 @@ if uploaded:
 
     st.write("Previzualizare:", df.head(10))
     cols = list(df.columns)
-    col_sku    = st.selectbox("Coloană SKU", cols, index=0)
-    col_name   = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
+    col_sku = st.selectbox("Coloană SKU", cols, index=0)
+    col_name = st.selectbox("Coloană Denumire", cols, index=1 if len(cols)>1 else 0)
     col_target = st.selectbox("Coloană țintă pentru EAN-13", cols, index=len(cols)-1)
-    mode       = st.radio("Cum cauți EAN?", ["Doar SKU", "Doar Nume"])
+    mode = st.radio("Cum cauți EAN?", ["Doar SKU", "Doar Nume"])
 
+    # opțiune: generare EAN dacă nu găsește
     synth_mode = st.radio(
         "Completează cu EAN sintetic dacă nu găsește prin Google?",
         ["Nu", "Da"]
     )
 
+    # coloană de notă
     note_col = "EAN_NOTE"
     if note_col not in df.columns:
         df[note_col] = ""
 
+    # set de EAN-uri deja existente și valide, pentru unicități
+    used_eans = set(str(x) for x in df[col_target].astype(str).tolist() if is_valid_ean13(str(x)))
+
+    # Alegere rânduri
     mode_rows = st.radio("Ce rânduri procesezi?", ["Primele N rânduri", "Toate rândurile"])
     if mode_rows == "Primele N rânduri":
         max_rows = st.number_input("N rânduri de procesat", 1, len(df), min(50,len(df)))
     else:
         max_rows = len(df)
 
-    # prefix de bază din fișier, dacă există
-    existing_valid = [str(v) for v in df[col_target].astype(str).tolist() if is_valid_ean13(str(v))]
-    base_prefix = most_common_prefix(existing_valid)  # None dacă nu există
-    used_eans = set([clean_digits(v) for v in existing_valid])
-
     if st.button("Pornește căutarea EAN"):
         done = 0; bar = st.progress(0); status = st.empty(); query_status = st.empty()
-
         for idx, row in df.head(int(max_rows)).iterrows():
-            sku  = str(row.get(col_sku,"")).strip()
-            name = str(row.get(col_name,"")).strip()
-            cur  = str(row.get(col_target,"")).strip()
-            note = str(row.get(note_col,"")).strip().lower()
+            sku, name = str(row.get(col_sku,"")).strip(), str(row.get(col_name,"")).strip()
+            current = str(row.get(col_target,"")).strip()
 
             # Skip dacă deja are EAN valid sau NOT_FOUND
-            if (cur and is_valid_ean13(cur)) or cur.upper()=="NOT_FOUND" or note=="synthetic":
+            if current and (is_valid_ean13(current) or current.upper()=="NOT_FOUND"):
                 done+=1; bar.progress(int(done*100/max_rows)); continue
 
             found = lookup(mode, sku, name, query_status)
-
             if found and is_valid_ean13(found):
                 df.at[idx, col_target] = found
-                df.at[idx, note_col]   = "found"
-                used_eans.add(clean_digits(found))
+                df.at[idx, note_col] = "found"
+                used_eans.add(found)
             else:
                 if synth_mode == "Da":
-                    syn = build_synthetic_ean(sku, name, base_prefix, used_eans)
-                    df.at[idx, col_target] = syn
-                    df.at[idx, note_col]   = "synthetic"
-                    used_eans.add(clean_digits(syn))
+                    seed = f"{sku}|{name}"
+                    code = generate_synthetic_ean_from(seed, used_eans)
+                    if is_valid_ean13(code):
+                        df.at[idx, col_target] = code
+                        df.at[idx, note_col] = "synthetic"
+                        used_eans.add(code)
+                    else:
+                        df.at[idx, col_target] = "NOT_FOUND"
+                        df.at[idx, note_col] = "gen_error"
                 else:
                     df.at[idx, col_target] = "NOT_FOUND"
-                    df.at[idx, note_col]   = "not_found"
+                    df.at[idx, note_col] = "not_found"
 
             done+=1
             if done%5==0: status.write(f"Procesate: {done}/{int(max_rows)}")
