@@ -12,15 +12,14 @@ except Exception:
     create_client = None
     Client = None
 
-# =============== App UI ===============
 st.set_page_config(page_title="GTIN/EAN Finder via Google CSE (Excel)", layout="wide")
 st.title("GTIN/EAN Finder via Google CSE (Excel)")
 
-# --- Google API secrets (root-level in secrets.toml) ---
+# --- Google API (root-level secrets) ---
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
 GOOGLE_CSE_CX  = st.secrets.get("GOOGLE_CSE_CX")
 
-# --- Supabase secrets (section [supabase]) ---
+# --- Supabase ([supabase] in secrets.toml) ---
 SUPABASE_URL = st.secrets.get("supabase", {}).get("url")
 SUPABASE_KEY = st.secrets.get("supabase", {}).get("anon_key") or st.secrets.get("supabase", {}).get("service_key")
 
@@ -36,7 +35,6 @@ def check_supabase_connection():
     if not SUPA_ENABLED:
         return ("OFF", "Chei lipsă sau client indisponibil")
     try:
-        # test select (tabela poate să nu existe încă)
         _ = supa.table(SUPA_TABLE).select("*").limit(1).execute()
         return ("ON", f"Conectat la '{SUPA_TABLE}'")
     except Exception as e:
@@ -48,7 +46,6 @@ st.sidebar.caption(SUPA_MSG)
 
 if "request_count" not in st.session_state:
     st.session_state["request_count"] = 0
-
 DAILY_LIMIT = 100
 
 # =============== EAN utils ===============
@@ -116,7 +113,8 @@ def google_search(query: str, num: int = 5):
     params = {"key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": min(num, 10), "safe": "off"}
     r = requests.get("https://www.googleapis.com/customsearch/v1", params=params, timeout=12)
     st.session_state["request_count"] += 1
-    if r.status_code != 200: return []
+    if r.status_code != 200:
+        return []
     return r.json().get("items", []) or []
 
 def fetch_url_text(url: str, timeout: int = 12) -> str:
@@ -149,48 +147,43 @@ def lookup(mode: str, sku: str, name: str, query_status, max_urls: int = 5):
     return choose_best_ean(texts)
 
 def to_excel_bytes(df: pd.DataFrame, col_target: str, note_col: str) -> bytes:
-    # redenumește coloana țintă în header-ul exact din Excel
+    # redenumește coloanele pentru export exact ca în Excel
     df_export = df.rename(columns={
         col_target: "GTIN, UPC, EAN, or ISBN",
-        note_col: "EAN_NOTE"
+        note_col:   "EAN_NOTE"
     })
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_export.to_excel(writer, index=False, sheet_name="EANs")
     return output.getvalue()
 
-# =============== Supabase helpers ===============
-# Tabel coloane: "ID", "SKU", "GTIN_UPC_EAN_or_ISBN", "Name", "EAN_NOTE"
+# =============== Supabase helpers (lowercase schema) ===============
+# tabela: ean_progress(id bigint, sku text, gtin_upc_ean_or_isbn text, name text, ean_note text, inserted_at timestamptz)
 def supa_upsert_row(id_val, sku, gtin, name, note):
     if not supa: return
     payload = {
-        "ID": None if pd.isna(id_val) else int(id_val),
-        "SKU": sku,
-        "GTIN_UPC_EAN_or_ISBN": gtin,
-        "Name": name,
-        "EAN_NOTE": note,
+        "id": None if (id_val is None or (isinstance(id_val, float) and pd.isna(id_val))) else int(id_val),
+        "sku": sku,
+        "gtin_upc_ean_or_isbn": gtin,
+        "name": name,
+        "ean_note": note,
     }
-    # upsert pe (ID, SKU) pentru a nu duplica
     try:
-        supa.table(SUPA_TABLE).upsert(payload, on_conflict="ID,SKU").execute()
+        supa.table(SUPA_TABLE).upsert(payload, on_conflict="id,sku").execute()
     except Exception as e:
-        st.sidebar.error(f"Supabase upsert fail (ID={id_val}, SKU={sku}): {e}")
+        st.sidebar.error(f"Supabase upsert fail (id={id_val}, sku={sku}): {e}")
 
 def supa_fetch_existing() -> dict[tuple, dict]:
-    """
-    Returnează map {(ID, SKU): {"GTIN":..., "Name":..., "EAN_NOTE":...}}
-    """
-    if not supa:
-        return {}
+    if not supa: return {}
     try:
-        data = supa.table(SUPA_TABLE).select("ID,SKU,GTIN_UPC_EAN_or_ISBN,Name,EAN_NOTE").execute().data or []
+        data = supa.table(SUPA_TABLE).select("id,sku,gtin_upc_ean_or_isbn,name,ean_note").execute().data or []
         out = {}
         for r in data:
-            key = (r.get("ID"), r.get("SKU"))
+            key = (r.get("id"), r.get("sku"))
             out[key] = {
-                "GTIN": r.get("GTIN_UPC_EAN_or_ISBN"),
-                "Name": r.get("Name"),
-                "EAN_NOTE": r.get("EAN_NOTE"),
+                "GTIN": r.get("gtin_upc_ean_or_isbn"),
+                "Name": r.get("name"),
+                "EAN_NOTE": r.get("ean_note"),
             }
         return out
     except Exception as e:
@@ -213,7 +206,6 @@ if uploaded:
     st.write("Previzualizare:", df.head(10))
     cols = list(df.columns)
 
-    # încearcă să preselecteze după headerele tale
     def idx_of(name, fallback=0):
         try:
             return cols.index(name)
@@ -223,7 +215,6 @@ if uploaded:
     col_id    = st.selectbox("Coloană ID", cols, index=idx_of("ID", 0))
     col_sku   = st.selectbox("Coloană SKU", cols, index=idx_of("SKU", 1 if len(cols) > 1 else 0))
     col_name  = st.selectbox("Coloană Name", cols, index=idx_of("Name", 2 if len(cols) > 2 else 0))
-    # în fișier header este "GTIN, UPC, EAN, or ISBN"
     col_target = st.selectbox("Coloană țintă pentru EAN-13", cols, index=idx_of("GTIN, UPC, EAN, or ISBN", len(cols)-1))
 
     mode = st.radio("Cum cauți EAN?", ["Doar SKU", "Doar Nume"])
@@ -233,14 +224,11 @@ if uploaded:
     if note_col not in df.columns:
         df[note_col] = ""
 
-    # selectare rânduri
     mode_rows = st.radio("Ce rânduri procesezi?", ["Primele N rânduri", "Toate rândurile"])
     max_rows = st.number_input("N rânduri de procesat", 1, len(df), min(50, len(df))) if mode_rows == "Primele N rânduri" else len(df)
 
-    # preia ce există deja în Supabase pentru a evita recăutarea
+    # citește ce există deja în Supabase și aplică în DataFrame
     existing = supa_fetch_existing()
-
-    # aplică valori deja procesate, dacă se potrivesc ID+SKU
     for idx in df.index:
         key = (None if pd.isna(df.at[idx, col_id]) else int(df.at[idx, col_id]), str(df.at[idx, col_sku]))
         if key in existing:
@@ -250,7 +238,6 @@ if uploaded:
             if rec.get("EAN_NOTE"):
                 df.at[idx, note_col] = rec["EAN_NOTE"]
 
-    # set de EAN-uri valide deja în foaie
     used_eans = set(x for x in df[col_target].astype(str).tolist() if is_valid_ean13(str(x)))
 
     if st.button("Pornește căutarea EAN"):
@@ -268,12 +255,11 @@ if uploaded:
             current = str(row.get(col_target, "")).strip()
             note    = str(row.get(note_col, "")).strip().lower()
 
-            # skip dacă avem deja în tabel valid/NOT_FOUND/synthetic
+            # skip dacă deja avem rezultat stabil
             if (current and is_valid_ean13(current)) or current.upper() == "NOT_FOUND" or note == "synthetic":
                 supa_upsert_row(id_val, sku, current if current else None, name, note or ("not_found" if current.upper()=="NOT_FOUND" else "found"))
                 done += 1; bar.progress(int(done*100/total)); continue
 
-            # dacă (ID, SKU) există în Supabase cu rezultat, sare
             key = (None if pd.isna(id_val) else int(id_val), sku)
             if key in existing and existing[key].get("GTIN"):
                 df.at[idx, col_target] = existing[key]["GTIN"]
