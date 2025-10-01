@@ -164,10 +164,15 @@ def write_result(id_val, sku, name, ean_value, note_value):
     supa.table(TBL).update(payload).eq("id", id_val).execute()
 
 def supa_fetch_all_with_ean():
-    return (supa.table(TBL)
-            .select("id,sku,name,ean,ean_note")
-            .not_("ean","is","null").neq("ean","")
-            .execute().data or [])
+    # ia tot și păstrează doar rândurile cu EAN non-gol
+    rows = (
+        supa.table(TBL)
+        .select("id,sku,name,ean,ean_note")
+        .execute()
+        .data or []
+    )
+    return [r for r in rows if str(r.get("ean") or "").strip() != ""]
+
 
 def dedup_eans():
     rows = supa_fetch_all_with_ean()
