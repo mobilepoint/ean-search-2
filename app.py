@@ -4,7 +4,7 @@ import requests
 import streamlit as st
 from collections import defaultdict
 
-# ========== Supabase client ==========
+# ===== Supabase client =====
 try:
     from supabase import create_client
 except Exception:
@@ -13,7 +13,7 @@ except Exception:
 st.set_page_config(page_title="GTIN/EAN Finder pe Supabase", layout="wide")
 st.title("GTIN/EAN Finder (Google CSE) → scriere directă în Supabase")
 
-# ========== Secrete ==========
+# ===== Secrete =====
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
 GOOGLE_CSE_CX  = st.secrets.get("GOOGLE_CSE_CX")
 
@@ -23,7 +23,7 @@ SUPA_OK = bool(SUPABASE_URL and SUPABASE_KEY and create_client)
 supa = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPA_OK else None
 TBL = "ean_progress"
 
-# ========== Sidebar: conexiuni ==========
+# ===== Sidebar: conexiuni =====
 st.sidebar.header("Conexiuni")
 st.sidebar.write("Google API:", "ON" if (GOOGLE_API_KEY and GOOGLE_CSE_CX) else "OFF")
 if SUPA_OK:
@@ -38,7 +38,7 @@ else:
 if "request_count" not in st.session_state:
     st.session_state["request_count"] = 0
 
-# ========== EAN utils ==========
+# ===== EAN utils =====
 def ean13_check_digit(d12: str) -> int:
     if not re.fullmatch(r"\d{12}", d12):
         raise ValueError("d12 trebuie 12 cifre")
@@ -92,7 +92,7 @@ def choose_best_ean(texts_with_weights):
             scores[c] = scores.get(c, 0.0) + base * w
     return max(scores.items(), key=lambda kv: kv[1])[0] if scores else None
 
-# ========== Google CSE ==========
+# ===== Google CSE =====
 def google_search(query: str, num: int = 5):
     if not GOOGLE_API_KEY or not GOOGLE_CSE_CX:
         return []
@@ -133,7 +133,7 @@ def lookup(mode: str, sku: str, name: str, query_status, max_urls: int = 5):
         if best: return best
     return choose_best_ean(texts)
 
-# ========== Supabase helpers ==========
+# ===== Supabase helpers =====
 def count_total():
     res = supa.table(TBL).select("id", count="exact").execute()
     return res.count or 0
@@ -166,16 +166,10 @@ def write_result(id_val, sku, name, ean_value, note_value):
 def supa_fetch_all_with_ean():
     return (supa.table(TBL)
             .select("id,sku,name,ean,ean_note")
-            .not_("ean", "is", "null")
-            .neq("ean", "")
-            .execute()
-            .data or [])
+            .not_("ean","is","null").neq("ean","")
+            .execute().data or [])
 
 def dedup_eans():
-    """
-    Păstrează 1 rând per EAN: prioritate found > synthetic > altele; tie-break id minim.
-    Restul primesc EAN sintetic valid și unic. Returnează sumar.
-    """
     rows = supa_fetch_all_with_ean()
     if not rows:
         return {"groups": 0, "changed": 0}
@@ -204,8 +198,7 @@ def dedup_eans():
         groups += 1
 
         group_sorted = sorted(group, key=lambda r: (-prio(r.get("ean_note")), int(r.get("id") or 0)))
-        keep = group_sorted[0]
-        # rescrie restul
+        # păstrăm primul (prioritate mai mare); rescriem restul
         for r in group_sorted[1:]:
             rid   = r["id"]
             sku   = r.get("sku")
@@ -233,7 +226,7 @@ def dedup_eans():
 
     return {"groups": groups, "changed": changed}
 
-# ========== Sidebar: statistici ==========
+# ===== Sidebar: statistici + dedup =====
 if SUPA_OK:
     total = count_total()
     pending = count_pending()
@@ -248,20 +241,20 @@ if SUPA_OK:
     st.sidebar.write("gen_error:", count_status("gen_error"))
     st.sidebar.write("Google requests (sesiune):", st.session_state["request_count"])
 
-# ========== Controale rulare ==========
+st.sidebar.markdown("### Deduplicare EAN")
+if st.sidebar.button("Detectează și repară duplicatele"):
+    if not SUPA_OK:
+        st.sidebar.error("Supabase indisponibil.")
+    else:
+        with st.spinner("Rulez deduplicarea..."):
+            s = dedup_eans()
+        st.sidebar.success(f"Grupuri: {s['groups']}, rescrise: {s['changed']}")
+
+# ===== Controale rulare =====
 mode = st.radio("Caută EAN după:", ["Doar SKU", "Doar Nume"])
 synth_mode = st.radio("Dacă nu găsește, generează EAN sintetic:", ["Nu", "Da"])
 how_many = st.radio("Procesează:", ["Primele N fără EAN", "Toate fără EAN"])
 N = st.number_input("N", min_value=1, max_value=1_000_000, value=500) if how_many == "Primele N fără EAN" else None
-
-st.markdown("### Deduplicare EAN")
-if st.button("Detectează și repară duplicatele"):
-    if not SUPA_OK:
-        st.error("Supabase indisponibil.")
-    else:
-        with st.spinner("Rulez deduplicarea..."):
-            summary = dedup_eans()
-        st.success(f"Grupuri duplicate: {summary['groups']}. Rânduri rescrise: {summary['changed']}.")
 
 if st.button("Pornește procesarea"):
     if not SUPA_OK:
