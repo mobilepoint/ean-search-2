@@ -57,8 +57,7 @@ def is_valid_ean13(code: str) -> bool:
 def upc12_to_gtin13(upc12: str):
     if not re.fullmatch(r"\d{12}", upc12):
         return None
-    gt = "0" + upc12
-    return gt if is_valid_ean13(gt) else None
+    return make_ean13("0" + upc12)
 
 def ean13_from_seed(seed: str) -> str:
     h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
@@ -68,31 +67,7 @@ def ean13_from_seed(seed: str) -> str:
 def clean_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
 
-EAN_RE = re.compile(r"\b(?:\d[ \t\-]?){12,14}\b")
-
-def find_eans_in_text(text: str):
-    out, seen = [], set()
-    if not text: return out
-    for m in EAN_RE.finditer(text):
-        d = clean_digits(m.group(0))
-        if len(d) == 13 and is_valid_ean13(d):
-            if d not in seen: out.append(d); seen.add(d)
-        elif len(d) == 12:
-            gt = upc12_to_gtin13(d)
-            if gt and gt not in seen: out.append(gt); seen.add(gt)
-    return out
-
-def choose_best_ean(texts_with_weights):
-    scores = {}
-    for text, w in texts_with_weights:
-        for c in find_eans_in_text(text):
-            base = 1.0
-            if re.search(r"(ean|gtin|barcode|cod\s*ean|ean-13)", (text or "").lower()):
-                base += 1.0
-            scores[c] = scores.get(c, 0.0) + base * w
-    return max(scores.items(), key=lambda kv: kv[1])[0] if scores else None
-
-# ===== Google CSE =====
+# ===== Google CSE (nemodificat) =====
 def google_search(query: str, num: int = 5):
     if not GOOGLE_API_KEY or not GOOGLE_CSE_CX:
         return []
@@ -112,63 +87,11 @@ def fetch_url_text(url: str, timeout: int = 12) -> str:
     except Exception:
         return ""
 
-def lookup(mode: str, sku: str, name: str, query_status, max_urls: int = 5):
-    if mode == "Doar SKU":
-        queries = [f'"{sku}" ean', f'"{sku}" gtin']
-    else:
-        base = re.sub(r"\s+", " ", name or "").strip()
-        queries = [f'"{base}" ean', f'"{base}" gtin']
-    texts = []
-    for q in queries:
-        query_status.write(f"Query: {q}")
-        items = google_search(q, num=max_urls)
-        for rank, it in enumerate(items):
-            w = 1.0 + (max_urls - rank) * 0.1
-            texts.append((it.get("snippet",""), w))
-            link = it.get("link")
-            if link:
-                page = fetch_url_text(link)
-                if page: texts.append((page, w+0.5))
-        best = choose_best_ean(texts)
-        if best: return best
-    return choose_best_ean(texts)
-
 # ===== Supabase helpers =====
-def count_total():
-    res = supa.table(TBL).select("id", count="exact").execute()
-    return res.count or 0
-
-def count_pending():
-    # ean NULL sau gol
-    rows = supa.table(TBL).select("id,ean").execute().data or []
-    return sum(1 for r in rows if not str(r.get("ean") or "").strip())
-
-def count_status(val: str):
-    res = supa.table(TBL).select("id", count="exact").eq("ean_note", val).execute()
-    return res.count or 0
-
-def fetch_pending_batch(limit: int, offset: int = 0):
-    # fallback robust fără filtrări PostgREST complexe
-    rows = (supa.table(TBL).select("id,sku,name").order("id", desc=False).execute().data or [])
-    pending = [r for r in rows if not str(r.get("ean") or "").strip()]
-    return pending[offset: offset + limit]
-
-def write_result(id_val, sku, name, ean_value, note_value):
-    payload = {
-        "sku": sku if sku else None,  # SKU poate fi NULL
-        "name": name,
-        "ean": ean_value,
-        "ean_note": note_value
-    }
-    supa.table(TBL).update(payload).eq("id", id_val).execute()
-
-# ===== Deduplicare =====
 def supa_fetch_all_rows(page_size: int = 1000):
-    """Citește TOATE rândurile din ean_progress prin paginare."""
     out = []
     start = 0
     while True:
-        # ordonează pentru stabilitate, apoi paginează
         q = (supa.table(TBL)
              .select("id,sku,name,ean,ean_note")
              .order("id", desc=False)
@@ -183,13 +106,8 @@ def supa_fetch_all_rows(page_size: int = 1000):
         start += page_size
     return out
 
-
+# ===== Deduplicare =====
 def dedup_eans():
-    """
-    Elimină toate duplicatele pentru orice EAN non-gol ≠ 'NOT_FOUND'.
-    Păstrează 1 rând/valoare după prioritate: found > synthetic* > altele; tie-break: id minim.
-    Restul primesc EAN-13 sintetic valid și unic global.
-    """
     rows = supa_fetch_all_rows()
     if not rows:
         return {"groups": 0, "changed": 0}
@@ -215,124 +133,87 @@ def dedup_eans():
     changed = 0
 
     for val, grp in groups.items():
-        if len(grp) <= 1:
-            continue
+        if len(grp) <= 1: continue
         dup_groups += 1
-
         grp_sorted = sorted(grp, key=lambda r: (-prio(r.get("ean_note")), int(r.get("id") or 0)))
-        keeper = grp_sorted[0]  # păstrăm acest rând neschimbat
+        keeper = grp_sorted[0]
 
         for r in grp_sorted[1:]:
             rid   = r["id"]
             sku   = r.get("sku")
             name  = r.get("name")
-            note0 = (r.get("ean_note") or "").lower()
-
-            # EAN-13 sintetic valid și UNIC global
             base_seed = f"dedup|{rid}|{sku}|{name}"
             cand = ean13_from_seed(base_seed)
             i = 0
             while cand in used:
                 i += 1
                 cand = ean13_from_seed(f"{base_seed}|{i}")
-
-            new_note = "synthetic_dedup" if note0 == "found" else "synthetic"
-
             supa.table(TBL).update({
                 "sku": sku if sku else None,
                 "name": name,
                 "ean": cand,
-                "ean_note": new_note
+                "ean_note": "synthetic_dedup"
             }).eq("id", rid).execute()
-
             used.add(cand)
             changed += 1
 
     return {"groups": dup_groups, "changed": changed}
 
-# ===== Sidebar: statistici + dedup =====
-if SUPA_OK:
-    total = count_total()
-    pending = count_pending()
-    with_ean = total - pending
-    st.sidebar.header("Statistici")
-    st.sidebar.write("Total:", total)
-    st.sidebar.write("Cu EAN:", with_ean)
-    st.sidebar.write("Fără EAN:", pending)
-    st.sidebar.write("found:", count_status("found"))
-    st.sidebar.write("synthetic:", count_status("synthetic"))
-    st.sidebar.write("not_found:", count_status("not_found"))
-    st.sidebar.write("gen_error:", count_status("gen_error"))
-    st.sidebar.write("Google requests (sesiune):", st.session_state["request_count"])
+# ===== Nou: Normalizare & verificare EAN =====
+def normalize_and_fix_eans():
+    rows = supa_fetch_all_rows()
+    fixed, total = 0, 0
+    used = set()
 
-st.sidebar.markdown("### Deduplicare EAN")
+    for r in rows:
+        rid  = r["id"]
+        sku  = r.get("sku")
+        name = r.get("name")
+        raw  = str(r.get("ean") or "").strip()
+        note = r.get("ean_note") or ""
+
+        if not raw or raw.upper() == "NOT_FOUND":
+            continue
+
+        total += 1
+        digits = clean_digits(raw)
+        new_val = None
+
+        if len(digits) == 13 and is_valid_ean13(digits):
+            new_val = digits
+        elif len(digits) == 13:  # cifre dar check digit greșit
+            new_val = make_ean13(digits[:12])
+        elif len(digits) == 12:
+            new_val = make_ean13(digits)
+        else:
+            # regenerează din seed
+            base_seed = f"fix|{rid}|{sku}|{name}"
+            new_val = ean13_from_seed(base_seed)
+
+        # asigură unicități
+        i = 0
+        while new_val in used:
+            i += 1
+            new_val = ean13_from_seed(f"{base_seed}|{i}")
+
+        if new_val != raw:
+            supa.table(TBL).update({
+                "ean": new_val,
+                "ean_note": note if note else "fixed"
+            }).eq("id", rid).execute()
+            fixed += 1
+        used.add(new_val)
+
+    return {"checked": total, "fixed": fixed}
+
+# ===== Sidebar: statistici + dedup + fix =====
+st.sidebar.markdown("### Operațiuni pe tabel")
 if st.sidebar.button("Detectează și repară duplicatele"):
-    if not SUPA_OK:
-        st.sidebar.error("Supabase indisponibil.")
-    else:
-        with st.spinner("Rulez deduplicarea..."):
-            s = dedup_eans()
-        st.sidebar.success(f"Grupuri duplicate: {s['groups']}. Rânduri rescrise: {s['changed']}")
+    with st.spinner("Rulez deduplicarea..."):
+        s = dedup_eans()
+    st.sidebar.success(f"Grupuri duplicate: {s['groups']}. Rânduri rescrise: {s['changed']}")
 
-# ===== Controale rulare =====
-mode = st.radio("Caută EAN după:", ["Doar SKU", "Doar Nume"])
-synth_mode = st.radio("Dacă nu găsește, generează EAN sintetic:", ["Nu", "Da"])
-how_many = st.radio("Procesează:", ["Primele N fără EAN", "Toate fără EAN"])
-N = st.number_input("N", min_value=1, max_value=1_000_000, value=500) if how_many == "Primele N fără EAN" else None
-
-if st.button("Pornește procesarea"):
-    if not SUPA_OK:
-        st.error("Supabase indisponibil.")
-        st.stop()
-
-    # calculează ținta curentă
-    total_pending = count_pending()
-    target = total_pending if N is None else min(total_pending, int(N))
-
-    processed = 0
-    page = 200
-    bar = st.progress(0)
-    status = st.empty()
-    qstat = st.empty()
-    offset = 0
-
-    while processed < target:
-        take = min(page, target - processed)
-        batch = fetch_pending_batch(limit=take, offset=offset)
-        if not batch:
-            break
-
-        for rec in batch:
-            id_val = rec.get("id")
-            sku    = (rec.get("sku") or "").strip()
-            name   = (rec.get("name") or "").strip()
-
-            if id_val is None:
-                processed += 1
-                bar.progress(int(processed * 100 / max(1, target)))
-                continue
-
-            found = lookup(mode, sku, name, qstat)
-
-            if found and is_valid_ean13(found):
-                write_result(id_val, sku, name, found, "found")
-            else:
-                if synth_mode == "Da":
-                    seed = f"{sku}|{name}"
-                    code = ean13_from_seed(seed)
-                    write_result(id_val, sku, name, code, "synthetic")
-                else:
-                    write_result(id_val, sku, name, "NOT_FOUND", "not_found")
-
-            processed += 1
-            if processed % 10 == 0:
-                status.write(f"Procesate: {processed}/{target}")
-            bar.progress(int(processed * 100 / max(1, target)))
-            time.sleep(0.1)
-
-        offset += take
-
-    st.success(f"Final: procesate {processed} din {target}.")
-    if SUPA_OK:
-        st.sidebar.write("—")
-        st.sidebar.write("Cu EAN (după run):", count_total() - count_pending())
+if st.sidebar.button("Normalizează & verifică toate EAN"):
+    with st.spinner("Rulez normalizarea și verificarea..."):
+        s = normalize_and_fix_eans()
+    st.sidebar.success(f"Verificate: {s['checked']}, Reparări: {s['fixed']}")
