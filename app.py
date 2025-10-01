@@ -163,10 +163,26 @@ def write_result(id_val, sku, name, ean_value, note_value):
     supa.table(TBL).update(payload).eq("id", id_val).execute()
 
 # ===== Deduplicare =====
-def supa_fetch_all_rows():
-    return (supa.table(TBL)
-            .select("id,sku,name,ean,ean_note")
-            .execute().data or [])
+def supa_fetch_all_rows(page_size: int = 1000):
+    """Citește TOATE rândurile din ean_progress prin paginare."""
+    out = []
+    start = 0
+    while True:
+        # ordonează pentru stabilitate, apoi paginează
+        q = (supa.table(TBL)
+             .select("id,sku,name,ean,ean_note")
+             .order("id", desc=False)
+             .range(start, start + page_size - 1))
+        res = q.execute()
+        chunk = res.data or []
+        if not chunk:
+            break
+        out.extend(chunk)
+        if len(chunk) < page_size:
+            break
+        start += page_size
+    return out
+
 
 def dedup_eans():
     """
@@ -178,6 +194,7 @@ def dedup_eans():
     if not rows:
         return {"groups": 0, "changed": 0}
 
+    from collections import defaultdict
     groups = defaultdict(list)
     used = set()
 
@@ -201,8 +218,9 @@ def dedup_eans():
         if len(grp) <= 1:
             continue
         dup_groups += 1
+
         grp_sorted = sorted(grp, key=lambda r: (-prio(r.get("ean_note")), int(r.get("id") or 0)))
-        keep = grp_sorted[0]  # rămâne neschimbat
+        keeper = grp_sorted[0]  # păstrăm acest rând neschimbat
 
         for r in grp_sorted[1:]:
             rid   = r["id"]
@@ -210,6 +228,7 @@ def dedup_eans():
             name  = r.get("name")
             note0 = (r.get("ean_note") or "").lower()
 
+            # EAN-13 sintetic valid și UNIC global
             base_seed = f"dedup|{rid}|{sku}|{name}"
             cand = ean13_from_seed(base_seed)
             i = 0
