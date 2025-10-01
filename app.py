@@ -139,97 +139,97 @@ def count_total():
     return res.count or 0
 
 def count_pending():
-    res = supa.table(TBL).select("id", count="exact").or_("ean.is.null,ean.eq.").execute()
-    return res.count or 0
+    # ean NULL sau gol
+    rows = supa.table(TBL).select("id,ean").execute().data or []
+    return sum(1 for r in rows if not str(r.get("ean") or "").strip())
 
 def count_status(val: str):
     res = supa.table(TBL).select("id", count="exact").eq("ean_note", val).execute()
     return res.count or 0
 
 def fetch_pending_batch(limit: int, offset: int = 0):
-    res = (supa.table(TBL).select("id,sku,name")
-           .or_("ean.is.null,ean.eq.")
-           .order("id", desc=False)
-           .range(offset, offset + limit - 1)
-           .execute())
-    return res.data or []
+    # fallback robust fără filtrări PostgREST complexe
+    rows = (supa.table(TBL).select("id,sku,name").order("id", desc=False).execute().data or [])
+    pending = [r for r in rows if not str(r.get("ean") or "").strip()]
+    return pending[offset: offset + limit]
 
 def write_result(id_val, sku, name, ean_value, note_value):
     payload = {
-        "sku": sku if sku else None,  # sku poate fi NULL
+        "sku": sku if sku else None,  # SKU poate fi NULL
         "name": name,
         "ean": ean_value,
         "ean_note": note_value
     }
     supa.table(TBL).update(payload).eq("id", id_val).execute()
 
-def supa_fetch_all_with_ean():
-    # ia tot și păstrează doar rândurile cu EAN non-gol
-    rows = (
-        supa.table(TBL)
-        .select("id,sku,name,ean,ean_note")
-        .execute()
-        .data or []
-    )
-    return [r for r in rows if str(r.get("ean") or "").strip() != ""]
-
+# ===== Deduplicare =====
+def supa_fetch_all_rows():
+    return (supa.table(TBL)
+            .select("id,sku,name,ean,ean_note")
+            .execute().data or [])
 
 def dedup_eans():
-    rows = supa_fetch_all_with_ean()
+    """
+    Elimină toate duplicatele pentru orice EAN non-gol ≠ 'NOT_FOUND'.
+    Păstrează 1 rând/valoare după prioritate: found > synthetic* > altele; tie-break: id minim.
+    Restul primesc EAN-13 sintetic valid și unic global.
+    """
+    rows = supa_fetch_all_rows()
     if not rows:
         return {"groups": 0, "changed": 0}
 
-    by_ean = defaultdict(list)
+    groups = defaultdict(list)
+    used = set()
+
     for r in rows:
-        e = str(r.get("ean") or "")
-        if is_valid_ean13(e):
-            by_ean[e].append(r)
+        e = str(r.get("ean") or "").strip()
+        if e and e.upper() != "NOT_FOUND":
+            groups[e].append(r)
+            used.add(e)
 
-    existing = set(by_ean.keys())
-
-    def prio(note):
+    def prio(note: str) -> int:
         note = (note or "").lower()
         if note == "found": return 3
         if note.startswith("synthetic"): return 2
         if note == "not_found": return 1
         return 0
 
-    groups = 0
+    dup_groups = 0
     changed = 0
 
-    for ean_val, group in by_ean.items():
-        if len(group) <= 1:
+    for val, grp in groups.items():
+        if len(grp) <= 1:
             continue
-        groups += 1
+        dup_groups += 1
+        grp_sorted = sorted(grp, key=lambda r: (-prio(r.get("ean_note")), int(r.get("id") or 0)))
+        keep = grp_sorted[0]  # rămâne neschimbat
 
-        group_sorted = sorted(group, key=lambda r: (-prio(r.get("ean_note")), int(r.get("id") or 0)))
-        # păstrăm primul (prioritate mai mare); rescriem restul
-        for r in group_sorted[1:]:
+        for r in grp_sorted[1:]:
             rid   = r["id"]
             sku   = r.get("sku")
             name  = r.get("name")
             note0 = (r.get("ean_note") or "").lower()
 
-            seed = f"dedup|{rid}|{sku}|{name}"
-            new_ean = ean13_from_seed(seed)
-            tries = 0
-            while (new_ean in existing) and tries < 5000:
-                tries += 1
-                new_ean = ean13_from_seed(f"{seed}|{tries}")
+            base_seed = f"dedup|{rid}|{sku}|{name}"
+            cand = ean13_from_seed(base_seed)
+            i = 0
+            while cand in used:
+                i += 1
+                cand = ean13_from_seed(f"{base_seed}|{i}")
 
             new_note = "synthetic_dedup" if note0 == "found" else "synthetic"
 
             supa.table(TBL).update({
                 "sku": sku if sku else None,
                 "name": name,
-                "ean": new_ean,
+                "ean": cand,
                 "ean_note": new_note
             }).eq("id", rid).execute()
 
-            existing.add(new_ean)
+            used.add(cand)
             changed += 1
 
-    return {"groups": groups, "changed": changed}
+    return {"groups": dup_groups, "changed": changed}
 
 # ===== Sidebar: statistici + dedup =====
 if SUPA_OK:
@@ -253,7 +253,7 @@ if st.sidebar.button("Detectează și repară duplicatele"):
     else:
         with st.spinner("Rulez deduplicarea..."):
             s = dedup_eans()
-        st.sidebar.success(f"Grupuri: {s['groups']}, rescrise: {s['changed']}")
+        st.sidebar.success(f"Grupuri duplicate: {s['groups']}. Rânduri rescrise: {s['changed']}")
 
 # ===== Controale rulare =====
 mode = st.radio("Caută EAN după:", ["Doar SKU", "Doar Nume"])
@@ -266,6 +266,7 @@ if st.button("Pornește procesarea"):
         st.error("Supabase indisponibil.")
         st.stop()
 
+    # calculează ținta curentă
     total_pending = count_pending()
     target = total_pending if N is None else min(total_pending, int(N))
 
