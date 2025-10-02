@@ -59,13 +59,27 @@ def upc12_to_gtin13(upc12: str):
         return None
     return make_ean13("0" + upc12)
 
-def ean13_from_seed(seed: str) -> str:
-    h = hashlib.sha256(seed.encode("utf-8")).hexdigest()
-    core12 = str(int(h, 16) % (10**12)).zfill(12)
-    return make_ean13(core12)
-
 def clean_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
+
+# seed → EAN-13 valid, prefix fix (ex: 594)
+def ean13_with_prefix(prefix3: str, payload9: str) -> str:
+    if not re.fullmatch(r"\d{3}", prefix3):
+        raise ValueError("prefix3 trebuie 3 cifre")
+    if not re.fullmatch(r"\d{9}", payload9):
+        raise ValueError("payload9 trebuie 9 cifre")
+    core12 = prefix3 + payload9
+    return make_ean13(core12)
+
+def ean13_from_seed_prefix(seed: str, used: set, prefix3: str = "594") -> str:
+    base = int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) % (10**9)
+    for i in range(1000000):
+        payload9 = str((base + i) % (10**9)).zfill(9)
+        e = ean13_with_prefix(prefix3, payload9)
+        if e not in used:
+            return e
+    # fallback extrem
+    return ean13_with_prefix(prefix3, "0"*9)
 
 # ===== Google CSE (nemodificat) =====
 def google_search(query: str, num: int = 5):
@@ -89,8 +103,7 @@ def fetch_url_text(url: str, timeout: int = 12) -> str:
 
 # ===== Supabase helpers =====
 def supa_fetch_all_rows(page_size: int = 1000):
-    out = []
-    start = 0
+    out, start = [], 0
     while True:
         q = (supa.table(TBL)
              .select("id,sku,name,ean,ean_note")
@@ -98,11 +111,9 @@ def supa_fetch_all_rows(page_size: int = 1000):
              .range(start, start + page_size - 1))
         res = q.execute()
         chunk = res.data or []
-        if not chunk:
-            break
+        if not chunk: break
         out.extend(chunk)
-        if len(chunk) < page_size:
-            break
+        if len(chunk) < page_size: break
         start += page_size
     return out
 
@@ -112,7 +123,6 @@ def dedup_eans():
     if not rows:
         return {"groups": 0, "changed": 0}
 
-    from collections import defaultdict
     groups = defaultdict(list)
     used = set()
 
@@ -132,43 +142,40 @@ def dedup_eans():
     dup_groups = 0
     changed = 0
 
-    for val, grp in groups.items():
+    for _, grp in groups.items():
         if len(grp) <= 1: continue
         dup_groups += 1
         grp_sorted = sorted(grp, key=lambda r: (-prio(r.get("ean_note")), int(r.get("id") or 0)))
-        keeper = grp_sorted[0]
+        keeper = grp_sorted[0]  # păstrat
 
         for r in grp_sorted[1:]:
-            rid   = r["id"]
-            sku   = r.get("sku")
-            name  = r.get("name")
-            base_seed = f"dedup|{rid}|{sku}|{name}"
-            cand = ean13_from_seed(base_seed)
-            i = 0
-            while cand in used:
-                i += 1
-                cand = ean13_from_seed(f"{base_seed}|{i}")
+            rid, sku, name = r["id"], r.get("sku"), r.get("name")
+            seed = f"dedup|{rid}|{sku}|{name}"
+            cand = ean13_from_seed_prefix(seed, used, prefix3="594")
             supa.table(TBL).update({
                 "sku": sku if sku else None,
                 "name": name,
                 "ean": cand,
                 "ean_note": "synthetic_dedup"
             }).eq("id", rid).execute()
-            used.add(cand)
-            changed += 1
+            used.add(cand); changed += 1
 
     return {"groups": dup_groups, "changed": changed}
 
-# ===== Nou: Normalizare & verificare EAN =====
+# ===== Normalizare & verificare EAN (existent) =====
 def normalize_and_fix_eans():
     rows = supa_fetch_all_rows()
     fixed, total = 0, 0
     used = set()
 
+    # colectează deja folosite (curente)
+    for r in rows:
+        e = str(r.get("ean") or "").strip()
+        if e and e.upper() != "NOT_FOUND":
+            used.add(e)
+
     for r in rows:
         rid  = r["id"]
-        sku  = r.get("sku")
-        name = r.get("name")
         raw  = str(r.get("ean") or "").strip()
         note = r.get("ean_note") or ""
 
@@ -178,23 +185,22 @@ def normalize_and_fix_eans():
         total += 1
         digits = clean_digits(raw)
         new_val = None
+        base_seed = f"fix|{rid}|{r.get('sku')}|{r.get('name')}"
 
         if len(digits) == 13 and is_valid_ean13(digits):
             new_val = digits
-        elif len(digits) == 13:  # cifre dar check digit greșit
+        elif len(digits) == 13:
             new_val = make_ean13(digits[:12])
         elif len(digits) == 12:
             new_val = make_ean13(digits)
         else:
-            # regenerează din seed
-            base_seed = f"fix|{rid}|{sku}|{name}"
-            new_val = ean13_from_seed(base_seed)
+            new_val = ean13_from_seed_prefix(base_seed, used, "594")
 
-        # asigură unicități
+        # unicități
         i = 0
         while new_val in used:
             i += 1
-            new_val = ean13_from_seed(f"{base_seed}|{i}")
+            new_val = ean13_from_seed_prefix(f"{base_seed}|{i}", used, "594")
 
         if new_val != raw:
             supa.table(TBL).update({
@@ -206,7 +212,55 @@ def normalize_and_fix_eans():
 
     return {"checked": total, "fixed": fixed}
 
-# ===== Sidebar: statistici + dedup + fix =====
+# ===== NOU: Re-codare globală cu prefix 594, fără dubluri =====
+def recode_all_to_prefix_594():
+    """
+    Parcurge TOT tabelul și rescrie *toate* EAN-urile la prefix 594.
+    Generare stabilă din seed (id|sku|name), EAN-13 valid, fără duplicate globale.
+    Setează ean_note = 'synthetic_594' pentru rândurile modificate.
+    Returnează: total, updated, dup_after, invalid_after.
+    """
+    rows = supa_fetch_all_rows()
+    used = set()
+    total = len(rows)
+    updated = 0
+
+    # construiește setul 'used' cu EAN-urile țintă pe măsură ce generăm noi valori,
+    # ca să garantăm unicitatea globală în noul spațiu 594.
+    for r in rows:
+        rid = r["id"]
+        sku = r.get("sku")
+        name = r.get("name")
+        seed = f"recode594|{rid}|{sku}|{name}"
+        new_ean = ean13_from_seed_prefix(seed, used, prefix3="594")
+        old_ean = str(r.get("ean") or "").strip()
+
+        if new_ean != old_ean:
+            supa.table(TBL).update({
+                "ean": new_ean,
+                "ean_note": "synthetic_594"
+            }).eq("id", rid).execute()
+            updated += 1
+        used.add(new_ean)
+
+    # verificare după recodare
+    rows2 = supa_fetch_all_rows()
+    invalid_after = sum(1 for r in rows2
+                        if str(r.get("ean") or "").strip()
+                        and not is_valid_ean13(str(r.get("ean")).strip()))
+    # duplicate count
+    from collections import Counter
+    eans = [str(r.get("ean") or "").strip() for r in rows2 if str(r.get("ean") or "").strip()]
+    dup_after = sum(1 for _, c in Counter(eans).items() if c > 1)
+
+    return {
+        "total": total,
+        "updated": updated,
+        "invalid_after": invalid_after,
+        "dup_groups_after": dup_after
+    }
+
+# ===== Sidebar: statistici + dedup + fix + recode 594 =====
 st.sidebar.markdown("### Operațiuni pe tabel")
 if st.sidebar.button("Detectează și repară duplicatele"):
     with st.spinner("Rulez deduplicarea..."):
@@ -217,3 +271,12 @@ if st.sidebar.button("Normalizează & verifică toate EAN"):
     with st.spinner("Rulez normalizarea și verificarea..."):
         s = normalize_and_fix_eans()
     st.sidebar.success(f"Verificate: {s['checked']}, Reparări: {s['fixed']}")
+
+if st.sidebar.button("Recodează TOT la prefix 594"):
+    with st.spinner("Rescriu toate EAN-urile cu prefix 594 și elimin dublurile..."):
+        s = recode_all_to_prefix_594()
+    msg = f"Total: {s['total']}, Actualizate: {s['updated']}, Invalid după: {s['invalid_after']}, Grupuri duplicate după: {s['dup_groups_after']}"
+    if s["invalid_after"] == 0 and s["dup_groups_after"] == 0:
+        st.sidebar.success(msg)
+    else:
+        st.sidebar.warning(msg)
