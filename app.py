@@ -262,6 +262,7 @@ def recode_all_to_prefix_594():
 
 # ===== Sidebar: statistici + dedup + fix + recode 594 =====
 st.sidebar.markdown("### Operațiuni pe tabel")
+
 if st.sidebar.button("Detectează și repară duplicatele"):
     with st.spinner("Rulez deduplicarea..."):
         s = dedup_eans()
@@ -272,11 +273,14 @@ if st.sidebar.button("Normalizează & verifică toate EAN"):
         s = normalize_and_fix_eans()
     st.sidebar.success(f"Verificate: {s['checked']}, Reparări: {s['fixed']}")
 
+# ► Butonul nou:
 if st.sidebar.button("Recodează TOT la prefix 594"):
-    with st.spinner("Rescriu toate EAN-urile cu prefix 594 și elimin dublurile..."):
-        s = recode_all_to_prefix_594()
-    msg = f"Total: {s['total']}, Actualizate: {s['updated']}, Invalid după: {s['invalid_after']}, Grupuri duplicate după: {s['dup_groups_after']}"
-    if s["invalid_after"] == 0 and s["dup_groups_after"] == 0:
-        st.sidebar.success(msg)
+    if not SUPA_OK:
+        st.sidebar.error("Supabase indisponibil.")
     else:
-        st.sidebar.warning(msg)
+        with st.spinner("Rescriu toate EAN-urile cu prefix 594 și elimin dublurile..."):
+            s = recode_all_to_prefix_594()
+        st.sidebar.success(
+            f"Total: {s['total']}, Actualizate: {s['updated']}, "
+            f"Invalid după: {s['invalid_after']}, Grupuri duplicate după: {s['dup_groups_after']}"
+        )
