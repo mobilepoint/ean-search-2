@@ -2,7 +2,7 @@
 import re, time, hashlib
 import requests
 import streamlit as st
-from collections import defaultdict
+from collections import defaultdict, Counter
 
 # ===== Supabase client =====
 try:
@@ -62,7 +62,6 @@ def upc12_to_gtin13(upc12: str):
 def clean_digits(s: str) -> str:
     return re.sub(r"[^0-9]", "", s or "")
 
-# seed → EAN-13 valid, prefix fix (ex: 594)
 def ean13_with_prefix(prefix3: str, payload9: str) -> str:
     if not re.fullmatch(r"\d{3}", prefix3):
         raise ValueError("prefix3 trebuie 3 cifre")
@@ -73,12 +72,11 @@ def ean13_with_prefix(prefix3: str, payload9: str) -> str:
 
 def ean13_from_seed_prefix(seed: str, used: set, prefix3: str = "594") -> str:
     base = int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) % (10**9)
-    for i in range(1000000):
+    for i in range(1_000_000):
         payload9 = str((base + i) % (10**9)).zfill(9)
         e = ean13_with_prefix(prefix3, payload9)
         if e not in used:
             return e
-    # fallback extrem
     return ean13_with_prefix(prefix3, "0"*9)
 
 # ===== Google CSE (nemodificat) =====
@@ -117,6 +115,12 @@ def supa_fetch_all_rows(page_size: int = 1000):
         start += page_size
     return out
 
+def supa_max_id():
+    # ia maximul de id; dacă tabela e goală, pornește de la 1
+    res = supa.table(TBL).select("id").order("id", desc=True).limit(1).execute()
+    rows = res.data or []
+    return int(rows[0]["id"]) if rows else 1
+
 # ===== Deduplicare =====
 def dedup_eans():
     rows = supa_fetch_all_rows()
@@ -146,7 +150,7 @@ def dedup_eans():
         if len(grp) <= 1: continue
         dup_groups += 1
         grp_sorted = sorted(grp, key=lambda r: (-prio(r.get("ean_note")), int(r.get("id") or 0)))
-        keeper = grp_sorted[0]  # păstrat
+        keeper = grp_sorted[0]
 
         for r in grp_sorted[1:]:
             rid, sku, name = r["id"], r.get("sku"), r.get("name")
@@ -162,13 +166,12 @@ def dedup_eans():
 
     return {"groups": dup_groups, "changed": changed}
 
-# ===== Normalizare & verificare EAN (existent) =====
+# ===== Normalizare & verificare EAN =====
 def normalize_and_fix_eans():
     rows = supa_fetch_all_rows()
     fixed, total = 0, 0
     used = set()
 
-    # colectează deja folosite (curente)
     for r in rows:
         e = str(r.get("ean") or "").strip()
         if e and e.upper() != "NOT_FOUND":
@@ -178,15 +181,12 @@ def normalize_and_fix_eans():
         rid  = r["id"]
         raw  = str(r.get("ean") or "").strip()
         note = r.get("ean_note") or ""
-
         if not raw or raw.upper() == "NOT_FOUND":
             continue
 
         total += 1
         digits = clean_digits(raw)
-        new_val = None
         base_seed = f"fix|{rid}|{r.get('sku')}|{r.get('name')}"
-
         if len(digits) == 13 and is_valid_ean13(digits):
             new_val = digits
         elif len(digits) == 13:
@@ -196,7 +196,6 @@ def normalize_and_fix_eans():
         else:
             new_val = ean13_from_seed_prefix(base_seed, used, "594")
 
-        # unicități
         i = 0
         while new_val in used:
             i += 1
@@ -212,55 +211,60 @@ def normalize_and_fix_eans():
 
     return {"checked": total, "fixed": fixed}
 
-# ===== NOU: Re-codare globală cu prefix 594, fără dubluri =====
+# ===== Re-codare globală 594 =====
 def recode_all_to_prefix_594():
-    """
-    Parcurge TOT tabelul și rescrie *toate* EAN-urile la prefix 594.
-    Generare stabilă din seed (id|sku|name), EAN-13 valid, fără duplicate globale.
-    Setează ean_note = 'synthetic_594' pentru rândurile modificate.
-    Returnează: total, updated, dup_after, invalid_after.
-    """
     rows = supa_fetch_all_rows()
-    used = set()
-    total = len(rows)
-    updated = 0
-
-    # construiește setul 'used' cu EAN-urile țintă pe măsură ce generăm noi valori,
-    # ca să garantăm unicitatea globală în noul spațiu 594.
+    used, total, updated = set(), len(rows), 0
     for r in rows:
-        rid = r["id"]
-        sku = r.get("sku")
-        name = r.get("name")
+        rid, sku, name = r["id"], r.get("sku"), r.get("name")
         seed = f"recode594|{rid}|{sku}|{name}"
         new_ean = ean13_from_seed_prefix(seed, used, prefix3="594")
         old_ean = str(r.get("ean") or "").strip()
-
         if new_ean != old_ean:
-            supa.table(TBL).update({
-                "ean": new_ean,
-                "ean_note": "synthetic_594"
-            }).eq("id", rid).execute()
+            supa.table(TBL).update({"ean": new_ean, "ean_note": "synthetic_594"}).eq("id", rid).execute()
             updated += 1
         used.add(new_ean)
 
-    # verificare după recodare
     rows2 = supa_fetch_all_rows()
-    invalid_after = sum(1 for r in rows2
-                        if str(r.get("ean") or "").strip()
-                        and not is_valid_ean13(str(r.get("ean")).strip()))
-    # duplicate count
-    from collections import Counter
+    invalid_after = sum(1 for r in rows2 if str(r.get("ean") or "").strip() and not is_valid_ean13(str(r.get("ean")).strip()))
     eans = [str(r.get("ean") or "").strip() for r in rows2 if str(r.get("ean") or "").strip()]
     dup_after = sum(1 for _, c in Counter(eans).items() if c > 1)
+    return {"total": total, "updated": updated, "invalid_after": invalid_after, "dup_groups_after": dup_after}
 
+# ===== NOU: generează 200 EAN libere (prefix 594) și inserează rânduri noi =====
+def generate_200_free_pool(prefix="594"):
+    rows = supa_fetch_all_rows()
+    used = {str(r.get("ean") or "").strip() for r in rows if str(r.get("ean") or "").strip()}
+    start_id = supa_max_id()
+    batch = []
+    # seed stabil + unicitate globală
+    for i in range(1, 201):
+        new_id = start_id + i  # nu atinge rândurile existente
+        seed = f"pool594|{new_id}"
+        e = ean13_from_seed_prefix(seed, used, prefix3=prefix)
+        used.add(e)
+        batch.append({
+            "id": new_id,
+            "sku": None,
+            "name": "POOL",
+            "ean": e,
+            "ean_note": "synthetic_pool"
+        })
+    # inserare în 1-2 batch-uri
+    for chunk_start in range(0, len(batch), 100):
+        supa.table(TBL).insert(batch[chunk_start:chunk_start+100]).execute()
+
+    # verificare rapidă
+    inserted_eans = [r["ean"] for r in batch]
+    ok_valid = all(is_valid_ean13(x) for x in inserted_eans)
+    ok_unique = len(inserted_eans) == len(set(inserted_eans))
     return {
-        "total": total,
-        "updated": updated,
-        "invalid_after": invalid_after,
-        "dup_groups_after": dup_after
+        "inserted": len(batch),
+        "valid_all": ok_valid,
+        "unique_all": ok_unique
     }
 
-# ===== Sidebar: statistici + dedup + fix + recode 594 =====
+# ===== Sidebar: operațiuni =====
 st.sidebar.markdown("### Operațiuni pe tabel")
 
 if st.sidebar.button("Detectează și repară duplicatele"):
@@ -273,14 +277,19 @@ if st.sidebar.button("Normalizează & verifică toate EAN"):
         s = normalize_and_fix_eans()
     st.sidebar.success(f"Verificate: {s['checked']}, Reparări: {s['fixed']}")
 
-# ► Butonul nou:
 if st.sidebar.button("Recodează TOT la prefix 594"):
-    if not SUPA_OK:
-        st.sidebar.error("Supabase indisponibil.")
+    with st.spinner("Rescriu toate EAN-urile cu prefix 594 și elimin dublurile..."):
+        s = recode_all_to_prefix_594()
+    st.sidebar.success(
+        f"Total: {s['total']}, Actualizate: {s['updated']}, "
+        f"Invalid după: {s['invalid_after']}, Grupuri duplicate după: {s['dup_groups_after']}"
+    )
+
+# ► Buton nou: generează 200 EAN libere
+if st.sidebar.button("Generează 200 EAN libere (prefix 594)"):
+    with st.spinner("Generez și inserez 200 EAN libere..."):
+        res = generate_200_free_pool(prefix="594")
+    if res["valid_all"] and res["unique_all"]:
+        st.sidebar.success(f"Adăugate: {res['inserted']} | valide: da | unice: da")
     else:
-        with st.spinner("Rescriu toate EAN-urile cu prefix 594 și elimin dublurile..."):
-            s = recode_all_to_prefix_594()
-        st.sidebar.success(
-            f"Total: {s['total']}, Actualizate: {s['updated']}, "
-            f"Invalid după: {s['invalid_after']}, Grupuri duplicate după: {s['dup_groups_after']}"
-        )
+        st.sidebar.warning(f"Adăugate: {res['inserted']} | valide: {res['valid_all']} | unice: {res['unique_all']}")
